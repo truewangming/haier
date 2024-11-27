@@ -1,19 +1,22 @@
 import logging
+import time
 from typing import Any, Dict
 
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.const import CONF_USERNAME, CONF_PASSWORD
+from homeassistant.const import CONF_TOKEN
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.config_validation import multi_select
 
 from .const import DOMAIN, FILTER_TYPE_EXCLUDE, FILTER_TYPE_INCLUDE
-from .core.client import HaierClient, HaierClientException
+from .core.client import HaierClientException, HaierClient
 from .core.config import AccountConfig, DeviceFilterConfig, EntityFilterConfig
 
 _LOGGER = logging.getLogger(__name__)
 
+CLIENT_ID = 'client_id'
+REFRESH_TOKEN = 'refresh_token'
 
 class HaierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 2
@@ -22,12 +25,21 @@ class HaierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: Dict[str, str] = {}
         if user_input is not None:
             try:
-                # 校验账号密码是否正确
-                client = HaierClient(user_input[CONF_USERNAME], user_input[CONF_PASSWORD])
-                await client.try_login()
+                # 根据refresh_token获取token
+                client = HaierClient(self.hass, user_input[CLIENT_ID], '')
+                token_info = await client.refresh_token(user_input[REFRESH_TOKEN])
+                # 获取用户信息
+                client = HaierClient(self.hass, user_input[CLIENT_ID], token_info.token)
+                user_info = await client.get_user_info()
 
-                return self.async_create_entry(title="Haier - {}".format(user_input[CONF_USERNAME]), data={
-                    'account': user_input
+                return self.async_create_entry(title="Haier - {}".format(user_info['mobile']), data={
+                    'account': {
+                        'client_id': user_input[CLIENT_ID],
+                        'token': token_info.token,
+                        'refresh_token': token_info.refresh_token,
+                        'expires_at': int(time.time()) + token_info.expires_in,
+                        'default_load_all_entity': user_input['default_load_all_entity']
+                    }
                 })
             except HaierClientException as e:
                 _LOGGER.warning(str(e))
@@ -37,8 +49,8 @@ class HaierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_USERNAME): str,
-                    vol.Required(CONF_PASSWORD): str,
+                    vol.Required(CLIENT_ID): str,
+                    vol.Required(REFRESH_TOKEN): str,
                     vol.Required('default_load_all_entity', default=True): bool,
                 }
             ),
@@ -77,15 +89,22 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         cfg = AccountConfig(self.hass, self.config_entry)
 
         if user_input is not None:
-            # 校验账号密码是否正确
-            client = HaierClient(user_input[CONF_USERNAME], user_input[CONF_PASSWORD])
             try:
-                await client.try_login()
+                # 根据refresh_token获取token
+                client = HaierClient(self.hass, user_input[CLIENT_ID], '')
+                token_info = await client.refresh_token(user_input[REFRESH_TOKEN])
+                # 获取用户信息
+                client = HaierClient(self.hass, user_input[CLIENT_ID], token_info.token)
+                user_info = await client.get_user_info()
 
-                cfg.username = user_input[CONF_USERNAME]
-                cfg.password = user_input[CONF_PASSWORD]
+                cfg.client_id = user_input[CLIENT_ID]
+                cfg.token = token_info.token
+                cfg.refresh_token = token_info.refresh_token
+                cfg.expires_at = int(time.time()) + token_info.expires_in
                 cfg.default_load_all_entity = user_input['default_load_all_entity']
-                cfg.save()
+                cfg.save(user_info['mobile'])
+
+                await self.hass.config_entries.async_reload(self.config_entry.entry_id)
 
                 return self.async_create_entry(title='', data={})
             except HaierClientException as e:
@@ -96,8 +115,8 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             step_id="account",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_USERNAME, default=cfg.username): str,
-                    vol.Required(CONF_PASSWORD, default=cfg.password): str,
+                    vol.Required(CLIENT_ID, default=cfg.client_id): str,
+                    vol.Required(REFRESH_TOKEN, default=cfg.refresh_token): str,
                     vol.Required('default_load_all_entity', default=cfg.default_load_all_entity): bool,
                 }
             ),
@@ -172,6 +191,8 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             cfg.set_target_entities(user_input['device_id'], user_input['target_entities'])
             cfg.save()
 
+            await self.hass.config_entries.async_reload(self.config_entry.entry_id)
+
             return self.async_create_entry(title='', data={})
 
         target_device_id = self.hass.data[DOMAIN].pop('entity_filter_target_device', '')
@@ -186,6 +207,8 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         for attribute in target_device.attributes:
             entities[attribute.key] = attribute.display_name
 
+        filtered = [item for item in cfg.get_target_entities(target_device_id) if item in entities]
+
         return self.async_show_form(
             step_id="entity_filter",
             data_schema=vol.Schema(
@@ -195,7 +218,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         FILTER_TYPE_EXCLUDE: 'Exclude',
                         FILTER_TYPE_INCLUDE: 'Include',
                     }),
-                    vol.Optional('target_entities', default=cfg.get_target_entities(target_device_id)): multi_select(
+                    vol.Optional('target_entities', default=filtered): multi_select(
                         entities
                     )
                 }

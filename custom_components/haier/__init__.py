@@ -1,10 +1,8 @@
-import glob
+import asyncio
 import json
 import logging
-import os
-from abc import ABC
-from datetime import datetime
-from typing import List
+import threading
+import time
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -12,71 +10,111 @@ from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN, SUPPORTED_PLATFORMS, FILTER_TYPE_EXCLUDE, FILTER_TYPE_INCLUDE
-from .coordinator import DeviceCoordinator
 from .core.attribute import HaierAttribute
-from .core.client import HaierClient, TokenHolder
+from .core.client import HaierClient, EVENT_DEVICE_DATA_CHANGED, HaierClientException, TokenInfo
 from .core.config import AccountConfig, DeviceFilterConfig, EntityFilterConfig
 from .core.device import HaierDevice
 
 _LOGGER = logging.getLogger(__name__)
 
-
-class HassTokenHolder(TokenHolder, ABC):
-
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry):
-        account_cfg = AccountConfig(hass, entry)
-        self._store = Store(hass, 1, 'haier/{}.token'.format(account_cfg.username))
-
-    async def async_set(self, token: str, created_at: datetime):
-        await self._store.async_save({
-            'token': token,
-            'created_at': datetime.timestamp(created_at)
-        })
-        _LOGGER.debug('token已成功缓存到HomeAssistant中')
-
-    # noinspection PyBroadException
-    async def async_get(self) -> (str, datetime):
-        try:
-            data = await self._store.async_load()
-            if not data:
-                return None, None
-
-            _LOGGER.debug('已从HomeAssistant加载到缓存的token')
-
-            return data['token'], datetime.fromtimestamp(data['created_at'])
-        except Exception:
-            await self._store.async_remove()
-            _LOGGER.warning('从HomeAssistant中加载token发生异常')
-            return None, None
-
-
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     hass.data.setdefault(DOMAIN, {
-        'coordinators': {},
-        'devices': []
+        'devices': [],
+        'signals': []
     })
 
-    account_cfg = AccountConfig(hass, entry)
-    client = HaierClient(account_cfg.username, account_cfg.password, HassTokenHolder(hass, entry))
+    await try_update_token(hass, entry)
+    # 定时更新token
+    token_signal = threading.Event()
+    hass.async_create_background_task(token_updater(hass, entry, token_signal), 'haier-token-updater')
+    hass.data[DOMAIN]['signals'].append(token_signal)
 
-    devices = await get_available_devices(client)
-    hass.data[DOMAIN]['devices'] = devices
+    account_cfg = AccountConfig(hass, entry)
+    client = HaierClient(hass, account_cfg.client_id, account_cfg.token)
+    devices = await client.get_devices()
     _LOGGER.debug('共获取到{}个设备'.format(len(devices)))
 
-    for platform in SUPPORTED_PLATFORMS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(entry, platform)
-        )
+    hass.data[DOMAIN]['devices'] = devices
+
+    # 保存设备attribute,方便调试
+    for device in devices:
+        store = Store(hass, 1, 'haier/device_{}.json'.format(device.id))
+        attrs = await client.get_digital_model(device.id)
+        await store.async_save(json.dumps({
+            'device': {
+                'name': device.name,
+                'type': device.type,
+                'product_code': device.product_code,
+                'product_name': device.product_name,
+                'wifi_type': device.wifi_type
+            },
+            'attributes': attrs
+        }, ensure_ascii=False))
+
+    # 监听设备数据
+    device_signal = threading.Event()
+    hass.async_create_background_task(client.listen_devices(devices, device_signal), 'haier-websocket')
+    hass.data[DOMAIN]['signals'].append(device_signal)
+
+    await hass.config_entries.async_forward_entry_setups(entry, SUPPORTED_PLATFORMS)
 
     entry.async_on_unload(entry.add_update_listener(entry_update_listener))
 
     return True
 
+async def token_updater(hass: HomeAssistant, entry: ConfigEntry, signal: threading.Event):
+    """
+    每1小时检查一次token有效性，若token刷新则重载集成
+    :param hass:
+    :param entry:
+    :param signal:
+    :return:
+    """
+    while not signal.is_set():
+        if await try_update_token(hass, entry):
+            _LOGGER.info('token refreshed, reload integration...')
+            await hass.config_entries.async_reload(entry.entry_id)
+            break
+        else:
+            _LOGGER.debug('token is valid')
+
+        await asyncio.sleep(3600)
+
+async def try_update_token(hass: HomeAssistant, entry: ConfigEntry):
+    """
+    尝试刷新token，刷新成功返回True，如refresh_token无效则会抛出异常
+    :param hass:
+    :param entry:
+    :return:
+    """
+    cfg = AccountConfig(hass, entry)
+    client = HaierClient(hass, cfg.client_id, cfg.token)
+
+    token_valid = True
+    try:
+        await client.get_user_info()
+    except HaierClientException:
+        token_valid = False
+
+    # token有效且里过期时间大于1天时不更新token
+    if token_valid and cfg.expires_at - int(time.time()) > 86400:
+        return False
+
+    token_info = await client.refresh_token(cfg.refresh_token)
+    cfg.token = token_info.token
+    cfg.refresh_token = token_info.refresh_token
+    cfg.expires_at = int(time.time()) + token_info.expires_in
+    cfg.save()
+
+    return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     for platform in SUPPORTED_PLATFORMS:
         if not await hass.config_entries.async_forward_entry_unload(entry, platform):
             return False
+
+    for signal in hass.data[DOMAIN]['signals']:
+        signal.set()
 
     del hass.data[DOMAIN]
 
@@ -84,23 +122,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
 
 
 async def entry_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    _LOGGER.debug('reload.....')
+    _LOGGER.debug('reload haier integration...')
     await hass.config_entries.async_reload(entry.entry_id)
-
-
-async def async_migrate_entry(hass, config_entry: ConfigEntry):
-    _LOGGER.info("Migrating from version %s", config_entry.version)
-
-    if config_entry.version == 1:
-        config_entry.version = 2
-        hass.config_entries.async_update_entry(config_entry, data={
-            'account': dict(config_entry.data)
-        })
-
-    _LOGGER.info("Migration to version %s successful", config_entry.version)
-
-    return True
-
 
 async def async_remove_config_entry_device(hass: HomeAssistant, config: ConfigEntry, device: DeviceEntry) -> bool:
     device_id = list(device.identifiers)[0][1]
@@ -127,52 +150,11 @@ async def async_remove_config_entry_device(hass: HomeAssistant, config: ConfigEn
 
     return True
 
-
-async def get_available_devices(client: HaierClient) -> List[HaierDevice]:
-    # 从账号中获取所有设备
-    devices = await client.get_devices() + await get_virtual_devices(client)
-    # 过滤掉未能获取到attribute的设备
-    available_devices = []
-    for device in devices:
-        attributes = device.attributes
-        if len(attributes) != 0:
-            available_devices.append(device)
-        else:
-            _LOGGER.error('Device [{}] 未获取到可用attribute'.format(device.id))
-
-    return available_devices
-
-
-async def get_virtual_devices(client: HaierClient) -> List[HaierDevice]:
-    target_folder = os.path.dirname(__file__) + '/virtual_devices'
-    if not os.path.exists(target_folder):
-        return []
-
-    devices = []
-    for file in glob.glob(target_folder + '/*.json'):
-        with open(file, 'r') as fp:
-            device = json.load(fp)
-            device['virtual'] = True
-            device = HaierDevice(client, device)
-            await device.async_init()
-            devices.append(device)
-
-    return devices
-
-
 async def async_register_entity(hass: HomeAssistant, entry: ConfigEntry, async_add_entities, platform, setup) -> None:
     entities = []
     for device in hass.data[DOMAIN]['devices']:
         if DeviceFilterConfig.is_skip(hass, entry, device.id):
             continue
-
-        # 初始化coordinator
-        if device.id not in hass.data[DOMAIN]['coordinators']:
-            coordinator = DeviceCoordinator(hass, device)
-            await coordinator.async_config_entry_first_refresh()
-            hass.data[DOMAIN]['coordinators'][device.id] = coordinator
-
-        coordinator = hass.data[DOMAIN]['coordinators'][device.id]
 
         for attribute in device.attributes:
             if attribute.platform != platform:
@@ -181,15 +163,6 @@ async def async_register_entity(hass: HomeAssistant, entry: ConfigEntry, async_a
             if EntityFilterConfig.is_skip(hass, entry, device.id, attribute.key):
                 continue
 
-            if attribute.key not in coordinator.data and 'customize' not in attribute.ext:
-                _LOGGER.warning(
-                    'Device {} attribute {} not found in the coordinator'.format(
-                        device.id,
-                        attribute.key
-                    )
-                )
-                continue
-
-            entities.append(setup(coordinator, device, attribute))
+            entities.append(setup(device, attribute))
 
     async_add_entities(entities)

@@ -11,9 +11,14 @@ class AccountConfig:
     """
     账户配置
     """
-    username: str = None
 
-    password: str = None
+    client_id: str = None
+
+    token: str = None
+
+    refresh_token: str = None
+
+    expires_at: int = None
 
     default_load_all_entity: bool = None
 
@@ -22,19 +27,23 @@ class AccountConfig:
         self._config = config
 
         cfg = config.data.get('account', {})
-        self.username = cfg.get('username', '')
-        self.password = cfg.get('password', '')
+        self.client_id = cfg.get('client_id', '')
+        self.token = cfg.get('token', '')
+        self.refresh_token = cfg.get('refresh_token', '')
+        self.expires_at = cfg.get('expires_at', 0)
         self.default_load_all_entity = cfg.get('default_load_all_entity', True)
 
-    def save(self):
+    def save(self, mobile: str = None):
         self._hass.config_entries.async_update_entry(
             self._config,
-            title='Haier: {}'.format(self.username),
+            title='Haier: {}'.format(mobile) if mobile else self._config.title,
             data={
                 **self._config.data,
                 'account': {
-                    'username': self.username,
-                    'password': self.password,
+                    'client_id': self.client_id,
+                    'token': self.token,
+                    'refresh_token': self.refresh_token,
+                    'expires_at': self.expires_at,
                     'default_load_all_entity': self.default_load_all_entity
                 }
             }

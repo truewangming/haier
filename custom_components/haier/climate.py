@@ -1,13 +1,12 @@
 import logging
 
-from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature, HVACMode, FAN_MIDDLE, FAN_HIGH, \
+from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature, HVACMode, FAN_HIGH, \
     FAN_MEDIUM, FAN_LOW, SWING_OFF, SWING_VERTICAL, SWING_HORIZONTAL, SWING_BOTH, FAN_OFF, FAN_AUTO
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import TEMP_CELSIUS, Platform
-from homeassistant.helpers.typing import HomeAssistantType
+from homeassistant.const import UnitOfTemperature, Platform
+from homeassistant.core import HomeAssistant
 
 from . import async_register_entity
-from .coordinator import DeviceCoordinator
 from .core.attribute import HaierAttribute
 from .core.device import HaierDevice
 from .entity import HaierAbstractEntity
@@ -16,21 +15,21 @@ from .helpers import try_read_as_bool
 _LOGGER = logging.getLogger(__name__)
 
 
-async def async_setup_entry(hass: HomeAssistantType, entry: ConfigEntry, async_add_entities) -> None:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities) -> None:
     await async_register_entity(
         hass,
         entry,
         async_add_entities,
         Platform.CLIMATE,
-        lambda coordinator, device, attribute: HaierClimate(coordinator, device, attribute)
+        lambda device, attribute: HaierClimate(device, attribute)
     )
 
 
 class HaierClimate(HaierAbstractEntity, ClimateEntity):
 
-    def __init__(self, coordinator: DeviceCoordinator, device: HaierDevice, attribute: HaierAttribute):
-        super().__init__(coordinator, device, attribute)
-        self._attr_temperature_unit = TEMP_CELSIUS
+    def __init__(self, device: HaierDevice, attribute: HaierAttribute):
+        super().__init__(device, attribute)
+        self._attr_temperature_unit = UnitOfTemperature.CELSIUS
         self._attr_hvac_modes = [
             HVACMode.OFF,
             HVACMode.AUTO,
@@ -59,15 +58,15 @@ class HaierClimate(HaierAbstractEntity, ClimateEntity):
                                         | ClimateEntityFeature.SWING_MODE
 
     def _update_value(self):
-        if 'indoorTemperature' in self.coordinator.data:
-            self._attr_current_temperature = float(self.coordinator.data['indoorTemperature'])
+        if 'indoorTemperature' in self._attributes_data:
+            self._attr_current_temperature = float(self._attributes_data['indoorTemperature'])
 
-        if 'indoorHumidity' in self.coordinator.data and float(self.coordinator.data['indoorHumidity']) != 0:
-            self._attr_current_humidity = float(self.coordinator.data['indoorHumidity'])
+        if 'indoorHumidity' in self._attributes_data and float(self._attributes_data['indoorHumidity']) != 0:
+            self._attr_current_humidity = float(self._attributes_data['indoorHumidity'])
 
-        self._attr_target_temperature = float(self.coordinator.data['targetTemperature'])
+        self._attr_target_temperature = float(self._attributes_data['targetTemperature'])
 
-        if not try_read_as_bool(self.coordinator.data['onOffStatus']):
+        if not try_read_as_bool(self._attributes_data['onOffStatus']):
             # 关机状态
             self._attr_hvac_mode = HVACMode.OFF
             self._attr_fan_mode = FAN_OFF
@@ -80,7 +79,7 @@ class HaierClimate(HaierAbstractEntity, ClimateEntity):
                 2: HVACMode.DRY,
                 4: HVACMode.HEAT,
                 6: HVACMode.FAN_ONLY
-            }.get(int(self.coordinator.data['operationMode']))
+            }.get(int(self._attributes_data['operationMode']))
 
             self._attr_fan_mode = {
                 1: FAN_HIGH,
@@ -112,7 +111,7 @@ class HaierClimate(HaierAbstractEntity, ClimateEntity):
             return
 
         # 关机状态则先开机
-        if not try_read_as_bool(self.coordinator.data['onOffStatus']):
+        if not try_read_as_bool(self._attributes_data['onOffStatus']):
             self._send_command({
                 'onOffStatus': True
             })
@@ -179,18 +178,16 @@ class HaierClimate(HaierAbstractEntity, ClimateEntity):
 
     def _get_wind_speed(self) -> str:
         if self._attribute.ext['exist_multiple_vents']:
-            return self.coordinator.data['windSpeedL']
+            return self._attributes_data['windSpeedL']
 
-        return self.coordinator.data['windSpeed']
+        return self._attributes_data['windSpeed']
 
     def _get_wind_direction_vertical(self) -> str:
         if self._attribute.ext['exist_multiple_vents']:
-            return self.coordinator.data['windDirectionVerticalL']
-
-        return self.coordinator.data['windDirectionVertical']
+            return self._attributes_data.get('windDirectionVerticalL', '0')
+        return self._attributes_data.get('windDirectionVertical', '0')
 
     def _get_wind_direction_horizontal(self) -> str:
         if self._attribute.ext['exist_multiple_vents']:
-            return self.coordinator.data['windDirectionHorizontalL']
-
-        return self.coordinator.data['windDirectionHorizontal']
+            return self._attributes_data.get('windDirectionHorizontalL', '0')
+        return self._attributes_data.get('windDirectionHorizontal', '0')
